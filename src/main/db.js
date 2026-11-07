@@ -53,6 +53,16 @@ CREATE TABLE locations(wh_id INTEGER NOT NULL REFERENCES warehouses(id), code TE
 INSERT OR IGNORE INTO locations(wh_id, code) SELECT DISTINCT wh_id, loc FROM stock WHERE loc <> '';
 ALTER TABLE so_parts ADD COLUMN serials TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE so_parts ADD COLUMN ret_serials TEXT NOT NULL DEFAULT '[]';
+`, `
+-- Service orders can be canceled. SQLite cannot change a CHECK rule in place, so the table is rebuilt
+-- with the same rows; parts and services keep pointing at it by name.
+CREATE TABLE service_orders_new(id TEXT PRIMARY KEY, date TEXT NOT NULL, vehicle_id TEXT NOT NULL REFERENCES vehicles(id), resp TEXT NOT NULL,
+  km INTEGER, status TEXT NOT NULL CHECK(status IN ('open','closed','auto','canceled')), closed_at TEXT, last_change TEXT NOT NULL, canceled_at TEXT);
+INSERT INTO service_orders_new(id,date,vehicle_id,resp,km,status,closed_at,last_change)
+  SELECT id,date,vehicle_id,resp,km,status,closed_at,last_change FROM service_orders;
+DROP TABLE service_orders;
+ALTER TABLE service_orders_new RENAME TO service_orders;
+CREATE INDEX ix_so_vehicle ON service_orders(vehicle_id);
 `];
 
 /* ---------- low-level helpers ---------- */
@@ -71,7 +81,15 @@ function open(file) {
   db.exec('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)');
   const v = +(get("SELECT value FROM meta WHERE key='schema'")?.value || 0);
   if (v > MIGRATIONS.length) fail('ბაზა შექმნილია პროგრამის უფრო ახალი ვერსიით — განაახლეთ Belo WMS');
-  MIGRATIONS.slice(v).forEach((sql, i) => tx(() => { db.exec(sql); run("INSERT OR REPLACE INTO meta VALUES('schema',?)", String(v + i + 1)); }));
+  // Foreign keys are switched off while upgrading so a table can be rebuilt; each step is checked before it is saved.
+  db.exec('PRAGMA foreign_keys=OFF');
+  try {
+    MIGRATIONS.slice(v).forEach((sql, i) => tx(() => {
+      db.exec(sql);
+      if (all('PRAGMA foreign_key_check').length) fail('ბაზის განახლება ვერ მოხერხდა (კავშირების შემოწმება)');
+      run("INSERT OR REPLACE INTO meta VALUES('schema',?)", String(v + i + 1));
+    }));
+  } finally { db.exec('PRAGMA foreign_keys=ON'); }
   return db;
 }
 function close() { if (db) { db.close(); db = null; } soCache = null; pendingSO.clear(); }
@@ -120,10 +138,12 @@ function serialList(v) {
 }
 const lineSerials = l => ({ all: JSON.parse(l.serials || '[]'), back: JSON.parse(l.ret_serials || '[]') });
 const isBack = (back, s) => back.some(x => x.toLowerCase() === s.toLowerCase());
+// Serials on a line that are still on the vehicle (issued and not returned).
+const outLineSerials = l => { const { all: sn, back } = lineSerials(l); return sn.filter(s => !isBack(back, s)); };
 // A serial may be on only one vehicle at a time: issued and not returned.
 function serialFree(pid, serials, exceptLine = 0) {
   if (!serials.length) return;
-  for (const l of all("SELECT p.*, o.id AS so FROM so_parts p JOIN service_orders o ON o.id=p.so_id WHERE p.product_id=? AND p.serials<>'[]' AND p.id<>?", pid, exceptLine)) {
+  for (const l of all("SELECT p.*, o.id AS so FROM so_parts p JOIN service_orders o ON o.id=p.so_id WHERE p.product_id=? AND p.serials<>'[]' AND p.id<>? AND o.status<>'canceled'", pid, exceptLine)) {
     const { all: sn, back } = lineSerials(l);
     const clash = serials.find(s => sn.some(x => x.toLowerCase() === s.toLowerCase()) && !isBack(back, s));
     if (clash) fail(`სერიული № ${clash} უკვე გაცემულია (${l.so}) და არ დაბრუნებულა`);
@@ -139,6 +159,7 @@ function whOk(w) {
 function product(id) { return get('SELECT * FROM products WHERE id=?', id) || fail('პროდუქტი ვერ მოიძებნა'); }
 function openSO(id) {
   const o = get('SELECT * FROM service_orders WHERE id=?', id) || fail('ორდერი ვერ მოიძებნა');
+  if (o.status === 'canceled') fail('ორდერი გაუქმებულია — ცვლილებისთვის ჯერ აღადგინეთ');
   if (o.status !== 'open') fail('ორდერი დახურულია — ცვლილებისთვის ჯერ გახსენით ხელახლა');
   return o;
 }
@@ -171,12 +192,13 @@ let soCache = null;            // Map id → service order as the screen sees it
 const pendingSO = new Set();   // ids changed since the last getState
 function soObject(o, parts, svcs) {
   return {
-    id: o.id, date: o.date, vid: o.vehicle_id, resp: o.resp, km: o.km, status: o.status, closedAt: o.closed_at, lastChange: o.last_change,
+    id: o.id, date: o.date, vid: o.vehicle_id, resp: o.resp, km: o.km, status: o.status, closedAt: o.closed_at, lastChange: o.last_change, canceledAt: o.canceled_at || null,
     parts: parts.map(l => {
       const sn = l.serials === '[]' ? [] : JSON.parse(l.serials), back = l.ret_serials === '[]' ? [] : JSON.parse(l.ret_serials);
       return { lid: l.id, pid: l.product_id, wh: l.wh_id, qty: l.qty, ret: l.ret, price: l.price, serials: sn, retSerials: back };
     }),
-    svcs: svcs.map(x => ({ sid: x.id, name: x.name, price: x.price }))
+    // A canceled order shows no services; they stay in the database so "undo cancel" can bring them back.
+    svcs: o.status === 'canceled' ? [] : svcs.map(x => ({ sid: x.id, name: x.name, price: x.price }))
   };
 }
 function loadAllSOs() {
@@ -478,7 +500,36 @@ const commands = {
   'so.reopen'({ id }) {
     const o = get('SELECT * FROM service_orders WHERE id=?', id) || fail('ორდერი ვერ მოიძებნა');
     if (o.status === 'open') fail('ორდერი უკვე ღიაა');
+    if (o.status === 'canceled') fail('ორდერი გაუქმებულია — გამოიყენეთ „გაუქმების გაუქმება“');
     run("UPDATE service_orders SET status='open', closed_at=NULL, last_change=? WHERE id=?", today(), id);
+  },
+  // Cancel: every part still on the order goes back to stock (like a 262 reversal) and the services disappear.
+  // Only open orders can be canceled; a closed order must be reopened first.
+  'so.cancel'({ id }) {
+    openSO(id);
+    for (const l of all('SELECT * FROM so_parts WHERE so_id=? ORDER BY id', id)) {
+      const net = r4(l.qty - l.ret);
+      if (net <= 0) continue;
+      const sn = outLineSerials(l);
+      addStock(l.product_id, l.wh_id, net);
+      move('ret', id, l.product_id, net, l.wh_id, null, ['ორდერის გაუქმება', sn.length ? 'S/N: ' + sn.join(', ') : ''].filter(Boolean).join(' · '));
+    }
+    run("UPDATE service_orders SET status='canceled', canceled_at=?, last_change=? WHERE id=?", today(), today(), id);
+  },
+  // Undo cancel: the same parts are issued again and the services come back; the order is open again.
+  // Refused (nothing changes) if the stock or a serial number has been used elsewhere in the meantime.
+  'so.uncancel'({ id }) {
+    const o = get('SELECT * FROM service_orders WHERE id=?', id) || fail('ორდერი ვერ მოიძებნა');
+    if (o.status !== 'canceled') fail('ორდერი გაუქმებული არ არის');
+    for (const l of all('SELECT * FROM so_parts WHERE so_id=? ORDER BY id', id)) {
+      const net = r4(l.qty - l.ret);
+      if (net <= 0) continue;
+      const sn = outLineSerials(l);
+      serialFree(l.product_id, sn, l.id);
+      addStock(l.product_id, l.wh_id, -net);
+      move('out', id, l.product_id, net, l.wh_id, null, ['გაუქმების გაუქმება', sn.length ? 'S/N: ' + sn.join(', ') : ''].filter(Boolean).join(' · '));
+    }
+    run("UPDATE service_orders SET status='open', canceled_at=NULL, closed_at=NULL, last_change=? WHERE id=?", today(), id);
   },
   'transfer.create'({ pid, from, qty, loc }) {
     if (setting('wh2') !== '1') fail('ჯერ ჩართეთ მეორე საწყობი პარამეტრებში');
@@ -549,7 +600,7 @@ const commands = {
     return run(`INSERT OR IGNORE INTO catalog(model, product_id)
       SELECT v.make || ' ' || v.model, p.product_id FROM so_parts p
       JOIN service_orders o ON o.id = p.so_id JOIN vehicles v ON v.id = o.vehicle_id
-      WHERE p.qty - p.ret > 0 GROUP BY v.make || ' ' || v.model, p.product_id HAVING COUNT(DISTINCT o.id) >= 2`).changes;
+      WHERE p.qty - p.ret > 0 AND o.status <> 'canceled' GROUP BY v.make || ' ' || v.model, p.product_id HAVING COUNT(DISTINCT o.id) >= 2`).changes;
   },
   'import.check'({ type, rows }) { return importCheck(type, rows || []); },
   'import.apply'({ type, rows }) {
@@ -595,5 +646,5 @@ function exec(name, args) {
   return result;
 }
 
-module.exports = { open, close, handle, exec, getState, setting, setSetting, today, nowTs, UserError, IMPORT_COLS,
+module.exports = { open, close, handle, exec, getState, setting, setSetting, today, nowTs, UserError, IMPORT_COLS, MIGRATIONS,
   setClock: fn => { clock = fn; } };

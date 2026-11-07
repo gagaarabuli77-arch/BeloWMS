@@ -94,7 +94,9 @@ const totQ = p => whs().reduce((a, w) => a + p.stock[w].q, 0);
 const isLow = p => p.min > 0 && totQ(p) < p.min;
 const modelKey = v => v.make + ' ' + v.model;
 const models = () => [...new Set(S.vehicles.map(modelKey))].sort();
-const partsCost = o => o.parts.reduce((a, l) => a + (l.qty - l.ret) * l.price, 0);
+const isCanceled = o => o.status === 'canceled';
+// A canceled order costs nothing: its parts went back to stock and its services were removed.
+const partsCost = o => isCanceled(o) ? 0 : o.parts.reduce((a, l) => a + (l.qty - l.ret) * l.price, 0);
 const svcCost = o => o.svcs.reduce((a, s) => a + (+s.price || 0), 0);
 const soCost = o => partsCost(o) + svcCost(o);
 const autoBase = o => o.lastChange || o.date;
@@ -110,11 +112,11 @@ function catIndex() {
   S.catalog.forEach(c => { entry(c.model, c.pid).manual = true; });
   S.sos.forEach(o => {
     const v = V(o.vid);
-    if (v) new Set(o.parts.filter(l => l.qty - l.ret > 0).map(l => l.pid)).forEach(pid => { entry(modelKey(v), pid).hist++; });
+    if (v && !isCanceled(o)) new Set(o.parts.filter(l => l.qty - l.ret > 0).map(l => l.pid)).forEach(pid => { entry(modelKey(v), pid).hist++; });
   });
   return (x.cat = idx);
 }
-const usedPids = o => new Set(o.parts.filter(l => l.qty - l.ret > 0).map(l => l.pid));
+const usedPids = o => new Set(isCanceled(o) ? [] : o.parts.filter(l => l.qty - l.ret > 0).map(l => l.pid));
 function catEntries(model, excludeSO) {
   const mm = catIndex().get(model);
   if (!mm) return [];
@@ -141,6 +143,7 @@ function findProduct(str) {
 function statusBadge(o) {
   if (o.status === 'open') return '<span class="badge b-open">ღია</span>';
   if (o.status === 'auto') return '<span class="badge b-auto">ავტო-დახურული</span>';
+  if (o.status === 'canceled') return '<span class="badge b-cancel">გაუქმებული</span>';
   return '<span class="badge b-closed">დახურული</span>';
 }
 const stockBadge = p => isLow(p) ? '<span class="badge b-low">მცირე მარაგი</span>' : '<span class="badge b-ok">საკმარისი</span>';
@@ -313,10 +316,10 @@ function movesTable(list) {
 let soFilter = 'all', soQ = '';
 VIEWS.sos = () => {
   const n = norm(soQ);
-  const match = k => o => k === 'all' || (k === 'open' ? o.status === 'open' : o.status !== 'open');
+  const match = k => o => k === 'all' || (k === 'open' ? o.status === 'open' : k === 'canceled' ? isCanceled(o) : o.status === 'closed' || o.status === 'auto');
   const list = S.sos.filter(match(soFilter)).filter(o => { if (!n) return true; const v = V(o.vid); return norm(o.id).includes(n) || norm(v.plate).includes(n) || norm(v.vin).includes(n) || norm(o.resp).includes(n); });
   return ph('სერვის ორდერები', 'ნაწილების გაცემა/დაბრუნება მანქანაზე · ღია ორდერი ავტომატურად იხურება ბოლო ცვლილებიდან ' + S.settings.autoClose + ' დღეში', btn('ახალი სერვის ორდერი', 'newSO()', 'primary', 'plus')) +
-    `<div class="filters"><div class="seg">${[['all', 'ყველა'], ['open', 'ღია'], ['closed', 'დახურული']].map(([k, l]) => `<button class="${soFilter === k ? 'on' : ''}" onclick="soFilter='${k}';render()">${l} (${S.sos.filter(match(k)).length})</button>`).join('')}</div>
+    `<div class="filters"><div class="seg">${[['all', 'ყველა'], ['open', 'ღია'], ['closed', 'დახურული'], ['canceled', 'გაუქმებული']].map(([k, l]) => `<button class="${soFilter === k ? 'on' : ''}" onclick="soFilter='${k}';render()">${l} (${S.sos.filter(match(k)).length})</button>`).join('')}</div>
    <input id="soq" placeholder="ძებნა: №, სახ. ნომერი, VIN, პასუხისმგებელი" value="${esc(soQ)}" oninput="soQ=this.value;LIM={};render();refocus('#soq')" style="width:340px"></div>
   <div class="card"><div class="tw"><table class="t"><thead><tr><th>№</th><th>თარიღი</th><th>ტექნიკა</th><th>VIN</th><th>პასუხისმგებელი</th><th class="num">ნაწილები</th><th class="num">მომსახურება</th><th class="num">სულ</th><th>სტატუსი</th></tr></thead><tbody>
   ${limited('sos', list).rows.map(o => { const v = V(o.vid); return `<tr class="click" onclick="go('so','${o.id}')"><td class="mono">${o.id}</td><td>${fmtD(o.date)}</td><td>${plate(v.plate)} <span class="sub">${esc(modelKey(v))}</span></td><td class="mono sub">${esc(v.vin)}</td><td>${esc(o.resp)}</td><td class="num">${money(partsCost(o))}</td><td class="num">${o.svcs.length ? money(svcCost(o)) : '—'}</td><td class="num"><b>${money(soCost(o))}</b></td><td>${statusBadge(o)}${o.status === 'open' ? `<div class="sub">${daysLeft(o) <= 0 ? 'იხურება დღეს' : 'იხურება ' + daysLeft(o) + ' დღეში'}</div>` : ''}</td></tr>`; }).join('') || emptyRow(9, S.sos.length ? 'ორდერი ვერ მოიძებნა' : 'სერვის ორდერი ჯერ არ არის — დააჭირეთ „ახალი სერვის ორდერი“')}
@@ -360,8 +363,11 @@ VIEWS.so = id => {
   const recs = catEntries(m, o.id).slice(0, 8), inOrder = new Set(o.parts.map(l => l.pid)), dl = daysLeft(o);
   const state = o.status === 'open'
     ? `<div class="note info">${ic('clock')}<div>ორდერი ღიაა. ბოლო ცვლილება: <b>${fmtD(autoBase(o))}</b>. ავტომატურად დაიხურება <b>${dl <= 0 ? 'დღეს' : dl + ' დღეში'}</b> (${fmtD(addDays(autoBase(o), S.settings.autoClose))}), თუ ახალი ცვლილება არ შევა.</div></div>`
+    : isCanceled(o) ? `<div class="note bad">${ic('alert')}<div>ორდერი <b>გაუქმებულია</b> ${fmtD(o.canceledAt)}. ყველა ნაწილი დაბრუნდა საწყობში, მომსახურებები წაიშალა. „გაუქმების გაუქმება“ ყველაფერს აღადგენს.</div></div>`
     : `<div class="note ${o.status === 'auto' ? 'warn' : ''}">${ic('lock')}<div>${o.status === 'auto' ? 'ორდერი <b>ავტომატურად დაიხურა</b>' : 'ორდერი <b>ხელით დაიხურა</b>'} ${fmtD(o.closedAt)}. ცვლილებისთვის გახსენით ხელახლა.</div></div>`;
-  const acts = (closed ? btn('ხელახლა გახსნა', `call('so.reopen',{id:'${o.id}'},'ორდერი ხელახლა გაიხსნა')`, '', 'unlock') : btn('ორდერის დახურვა', `call('so.close',{id:'${o.id}'},'ორდერი დაიხურა')`, '', 'lock')) + btn('PDF ფორმა', `printSO('${o.id}')`, '', 'download');
+  const acts = (isCanceled(o) ? btn('გაუქმების გაუქმება', `askUncancel('${o.id}')`, '', 'undo')
+    : closed ? btn('ხელახლა გახსნა', `call('so.reopen',{id:'${o.id}'},'ორდერი ხელახლა გაიხსნა')`, '', 'unlock')
+    : btn('ორდერის დახურვა', `call('so.close',{id:'${o.id}'},'ორდერი დაიხურა')`, '', 'lock') + btn('გაუქმება', `askCancel('${o.id}')`, 'danger', 'x')) + btn('PDF ფორმა', `printSO('${o.id}')`, '', 'download');
   return ph(`სერვის ორდერი <span class="mono" style="font-size:19px">${o.id}</span> ${statusBadge(o)}`, 'გახსნილია ' + fmtD(o.date), acts, `<a onclick="go('sos')">სერვის ორდერები</a> / ${o.id}`) + state +
     `<div class="info-strip">
     <div><label>ტექნიკა</label><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${plate(v.plate)}<a style="color:var(--accent);cursor:pointer;font-weight:500" onclick="go('vehicle','${v.id}')">${esc(modelKey(v))} · ${esc(v.year || '')}</a></div><div class="mono sub" style="margin-top:4px">VIN ${esc(v.vin)}</div></div>
@@ -372,14 +378,14 @@ VIEWS.so = id => {
   <div class="cols">
    <div>
     <div class="card"><header><h3>გაცემული ნაწილები</h3><span class="sub">${o.parts.length} ხაზი</span></header>
-     <div class="tw"><table class="t"><thead><tr><th>არტიკული</th><th>დასახელება</th>${wh2 ? '<th>საწყობი</th>' : ''}<th class="num">გაცემული</th><th class="num">დაბრუნებული</th><th class="num">ფასი</th><th class="num">ჯამი</th><th></th></tr></thead><tbody>
+     <div class="tw"><table class="t${isCanceled(o) ? ' cx' : ''}"><thead><tr><th>არტიკული</th><th>დასახელება</th>${wh2 ? '<th>საწყობი</th>' : ''}<th class="num">გაცემული</th><th class="num">დაბრუნებული</th><th class="num">ფასი</th><th class="num">ჯამი</th><th></th></tr></thead><tbody>
      ${o.parts.map(l => { const p = P(l.pid), net = l.qty - l.ret; return `<tr><td class="mono">${esc(p.art)}<div class="sub">${p.id}</div></td><td>${esc(p.name)}${l.serials.length ? `<div class="sub mono" style="margin-top:2px">S/N: ${l.serials.map(s => `<span style="white-space:nowrap">${l.retSerials.some(x => sameCode(x, s)) ? `<s title="დაბრუნებულია">${esc(s)}</s>` : esc(s)}</span>`).join(', ')}</div>` : ''}</td>${wh2 ? `<td>${esc(S.wh[l.wh])}</td>` : ''}<td class="num">${qfmt(l.qty)} ${esc(p.uom)}</td><td class="num">${l.ret ? qfmt(l.ret) : '—'}</td><td class="num">${money(l.price)}</td><td class="num"><b>${money(net * l.price)}</b></td><td style="white-space:nowrap">${!closed ? btn('S/N', `editSerials('${o.id}',${l.lid})`, 'sm ghost', '', false) : ''}${!closed && net > 0 ? `<button class="btn sm ghost" title="დაბრუნება საწყობში" onclick="retPart('${o.id}',${l.lid})">${ic('undo')}</button>` : ''}</td></tr>`; }).join('') || emptyRow(wh2 ? 8 : 7, 'ნაწილი ჯერ არ გაცემულა — აირჩიეთ ქვემოთ ან რეკომენდაციიდან')}
      </tbody><tfoot><tr><td colspan="${wh2 ? 6 : 5}">ნაწილები სულ</td><td class="num">${money(partsCost(o))}</td><td></td></tr></tfoot></table></div>
      ${closed ? '' : `<div class="addrow"><input id="sop" list="dlp" placeholder="არტიკული, კოდი ან დასახელება…" oninput="soWarn('${o.id}')" autocomplete="off"><input id="soqty" type="number" min="0" step="any" value="1" class="w80" title="რაოდენობა" oninput="soWarn('${o.id}')"><input id="sosn" class="mono w160" style="width:200px" autocomplete="off" placeholder="სერიული № (არასავალდ.)" title="რამდენიმე — მძიმით გამოყოფილი">${whSelect('sowh', 1, `soWarn('${o.id}')`)}<button class="btn primary" onclick="addPart('${o.id}')">${ic('arrowOut')}გაცემა</button></div><div id="sowarn" style="padding:0 16px"></div>`}
     </div>
     <div class="card"><header><h3>მომსახურება</h3><span class="sub">თავისუფალი დასახელება · ფასი არასავალდებულოა</span></header>
      <div class="tw"><table class="t"><thead><tr><th>დასახელება</th><th class="num">ფასი</th><th></th></tr></thead><tbody>
-     ${o.svcs.map(s => `<tr><td>${esc(s.name)}</td><td class="num">${s.price != null ? money(s.price) : '<span class="sub">ფასის გარეშე</span>'}</td><td style="width:40px">${closed ? '' : btn('', `call('so.delService',{id:'${o.id}',sid:${s.sid}})`, 'sm ghost danger', 'x')}</td></tr>`).join('') || emptyRow(3, 'მომსახურება არ არის დამატებული')}
+     ${o.svcs.map(s => `<tr><td>${esc(s.name)}</td><td class="num">${s.price != null ? money(s.price) : '<span class="sub">ფასის გარეშე</span>'}</td><td style="width:40px">${closed ? '' : btn('', `call('so.delService',{id:'${o.id}',sid:${s.sid}})`, 'sm ghost danger', 'x')}</td></tr>`).join('') || emptyRow(3, isCanceled(o) ? 'მომსახურებები წაიშალა ორდერის გაუქმებისას' : 'მომსახურება არ არის დამატებული')}
      </tbody></table></div>
      ${closed ? '' : `<div class="addrow"><input id="svn" list="dls" class="grow" placeholder="მომსახურების დასახელება, მაგ. „ზეთის შეცვლა“"><input id="svp" type="number" min="0" step="any" class="w160" placeholder="ფასი (არასავალდ.)"><button class="btn" onclick="addSvc('${o.id}')">${ic('plus')}დამატება</button></div>`}
     </div>
@@ -396,6 +402,14 @@ VIEWS.so = id => {
    </div>
   </div>`;
 };
+function askCancel(id) {
+  openModal('ორდერის გაუქმება', `<div class="note bad">${ic('alert')}<div>ნამდვილად გსურთ ორდერის <b class="mono">${id}</b> გაუქმება?<br>ყველა გაცემული ნაწილი დაბრუნდება საწყობში, მომსახურებები წაიშლება.</div></div>`,
+    btn('არა', 'closeModal()') + btn('დიახ, გაუქმება', `closeModal();call('so.cancel',{id:'${id}'},'ორდერი გაუქმდა — ნაწილები დაბრუნდა საწყობში')`, 'danger', 'x'));
+}
+function askUncancel(id) {
+  openModal('გაუქმების გაუქმება', `<div class="note warn">${ic('info')}<div>ნამდვილად გსურთ ორდერის <b class="mono">${id}</b> აღდგენა?<br>ნაწილები ხელახლა გაიცემა საწყობიდან, მომსახურებები დაბრუნდება და ორდერი ისევ ღია იქნება.</div></div>`,
+    btn('არა', 'closeModal()') + btn('დიახ, აღდგენა', `closeModal();call('so.uncancel',{id:'${id}'},'ორდერი აღდგა')`, 'primary', 'undo'));
+}
 function soWarn(oid) {
   const o = SO(oid), p = findProduct($('#sop').value), m = modelKey(V(o.vid)), w = $('#sowarn');
   if (!p) { w.innerHTML = ''; return; }
@@ -683,7 +697,7 @@ VIEWS.vehicle = id => {
   if (!v) return VIEWS.vehicles();
   const os = S.sos.filter(o => o.vid === id), tot = os.reduce((a, o) => a + soCost(o), 0), pts = os.reduce((a, o) => a + partsCost(o), 0);
   const agg = {};
-  os.forEach(o => o.parts.forEach(l => { agg[l.pid] = agg[l.pid] || { q: 0, c: 0 }; agg[l.pid].q += l.qty - l.ret; agg[l.pid].c += (l.qty - l.ret) * l.price; }));
+  os.filter(o => !isCanceled(o)).forEach(o => o.parts.forEach(l => { agg[l.pid] = agg[l.pid] || { q: 0, c: 0 }; agg[l.pid].q += l.qty - l.ret; agg[l.pid].c += (l.qty - l.ret) * l.price; }));
   const top = Object.entries(agg).filter(a => a[1].q > 0).sort((a, b) => b[1].c - a[1].c).slice(0, 6);
   return ph(`${plate(v.plate)} <span style="margin-left:6px">${esc(modelKey(v))}</span>`, `VIN <span class="mono">${esc(v.vin)}</span> · ${esc(v.year || '')} · ${qfmt(v.km)} კმ · ${esc(v.dept)}`,
     btn('რედაქტირება', `openVehicle('${v.id}')`, '', 'edit') + btn('სერვის ორდერი ამ მანქანაზე', `newSO('${v.id}')`, 'primary', 'plus'), `<a onclick="go('vehicles')">ტექნიკის რეესტრი</a> / ${esc(v.plate)}`) +
@@ -723,7 +737,7 @@ VIEWS.catalog = () => {
 /* ================= reports ================= */
 let repTab = 'veh', repV = 'all', repFrom = '', repTo = '', repWh = 'all', repLow = false;
 function vehReport() {
-  const os = S.sos.filter(o => (repV === 'all' || o.vid === repV) && o.date >= repFrom && o.date <= repTo);
+  const os = S.sos.filter(o => !isCanceled(o) && (repV === 'all' || o.vid === repV) && o.date >= repFrom && o.date <= repTo);
   const g = new Map(); os.forEach(o => { if (!g.has(o.vid)) g.set(o.vid, []); g.get(o.vid).push(o); });
   const byV = S.vehicles.map(v => { const vo = g.get(v.id) || []; return { v, n: vo.length, p: vo.reduce((a, o) => a + partsCost(o), 0), s: vo.reduce((a, o) => a + svcCost(o), 0) }; }).filter(r => r.n).sort((a, b) => (b.p + b.s) - (a.p + a.s));
   return { os, byV };
@@ -938,14 +952,15 @@ const pickOrder = parts => parts.slice().sort((a, b) => {
 });
 let pvSO = null;
 function printSO(id) {
-  const o = SO(id), v = V(o.vid), c = S.settings.company, st = { open: 'ღია', closed: 'დახურული', auto: 'ავტო-დახურული' }[o.status];
+  const o = SO(id), v = V(o.vid), c = S.settings.company, st = { open: 'ღია', closed: 'დახურული', auto: 'ავტო-დახურული', canceled: 'გაუქმებული' }[o.status];
   pvSO = id;
   $('#pvSheet').innerHTML = `<div class="sh-head"><div>${c.logo ? `<img class="sh-logo" src="${c.logo}" alt="">` : ''}<div class="sh-org">${esc(c.name)}</div><div>${[c.tin && 'ს/კ: ' + esc(c.tin), esc(c.address), esc(c.phone)].filter(Boolean).join(' · ')}</div><div>${esc(S.wh[1])}</div></div>
    <div style="text-align:right"><h2>სერვის ორდერი</h2><div class="mono" style="font-size:13px">№ ${o.id}</div><div>თარიღი: ${fmtD(o.date)} · სტატუსი: ${st}</div></div></div>
+   ${isCanceled(o) ? `<div class="sh-cancel">გაუქმებული · ${fmtD(o.canceledAt)} — ნაწილები დაბრუნდა საწყობში</div>` : ''}
    <table class="kv"><tr><th>სახელმწიფო ნომერი</th><td>${esc(v.plate)}</td><th>VIN კოდი</th><td class="mono">${esc(v.vin)}</td></tr>
     <tr><th>მარკა / მოდელი</th><td>${esc(modelKey(v))}${v.year ? ', ' + esc(v.year) : ''}</td><th>გარბენი</th><td>${qfmt(o.km)} კმ</td></tr>
     <tr><th>პასუხისმგებელი პირი</th><td colspan="3"><b>${esc(o.resp)}</b></td></tr></table>
-   <h3>გაცემული ნაწილები <span style="font-weight:400;font-size:10px">· დალაგებულია ლოკაციის მიხედვით (აღებისთვის)</span></h3><table><thead><tr><th>#</th><th>ლოკაცია</th><th>არტიკული</th><th>დასახელება</th><th>გაცემ.</th><th>დაბრ.</th><th>ერთ.</th><th>ფასი</th><th>ჯამი</th></tr></thead><tbody>
+   <h3>გაცემული ნაწილები <span style="font-weight:400;font-size:10px">· დალაგებულია ლოკაციის მიხედვით (აღებისთვის)</span></h3><table${isCanceled(o) ? ' class="cx"' : ''}><thead><tr><th>#</th><th>ლოკაცია</th><th>არტიკული</th><th>დასახელება</th><th>გაცემ.</th><th>დაბრ.</th><th>ერთ.</th><th>ფასი</th><th>ჯამი</th></tr></thead><tbody>
    ${pickOrder(o.parts).map((l, i) => { const p = P(l.pid), loc = p.stock[l.wh].loc; return `<tr><td>${i + 1}</td><td class="mono" style="white-space:nowrap"><b>${esc(loc || '—')}</b>${S.settings.wh2 ? `<div style="font-size:10px">${esc(S.wh[l.wh])}</div>` : ''}</td><td class="mono">${esc(p.art)}</td><td>${esc(p.name)}${l.serials.length ? `<div style="font-size:10px;margin-top:2px">S/N: ${l.serials.map(s => l.retSerials.some(x => sameCode(x, s)) ? esc(s) + ' (დაბრ.)' : esc(s)).join(', ')}</div>` : ''}</td><td class="num">${qfmt(l.qty)}</td><td class="num">${l.ret ? qfmt(l.ret) : ''}</td><td>${esc(p.uom)}</td><td class="num">${money(l.price)}</td><td class="num">${money((l.qty - l.ret) * l.price)}</td></tr>`; }).join('') || '<tr><td colspan="9">—</td></tr>'}
    </tbody><tfoot><tr><td colspan="8">ნაწილები სულ</td><td class="num">${money(partsCost(o))}</td></tr></tfoot></table>
    <h3>მომსახურება</h3><table><thead><tr><th>#</th><th>დასახელება</th><th>ფასი</th></tr></thead><tbody>${o.svcs.map((s, i) => `<tr><td style="width:24px">${i + 1}</td><td>${esc(s.name)}</td><td class="num" style="width:110px">${s.price != null ? money(s.price) : '—'}</td></tr>`).join('') || '<tr><td colspan="3">—</td></tr>'}</tbody></table>
