@@ -73,6 +73,20 @@ module.exports = function smoke(win, { app }) {
       await js(`await call('so.addService',{id:S.sos[0].id,name:'დროებითი'});`);
       await check('before restore svcs', `return S.sos[0].svcs.length`);
       await check('restore', `const r=await window.api.invoke('backup.restore',${JSON.stringify(file)});apply(r.state);render();return {ok:r.ok,svcs:S.sos[0].svcs.length,wh2:S.settings.wh2}`);
+      // Cancel a service order and undo the cancel.
+      await js(`go('sos');newSO(S.vehicles[1].id);$('#nsr').value='გ. კაპანაძე';await createSO();`);
+      await js(`const o=S.sos[0];$('#sop').value=S.products[1].id;$('#soqty').value=4;await addPart(o.id);$('#svn').value='დიაგნოსტიკა';$('#svp').value=40;await addSvc(o.id);`);
+      await check('before cancel', `const o=S.sos[0];return {id:o.id,status:o.status,oil:S.products[1].stock[1].q,svcs:o.svcs.length}`);
+      await js(`askCancel(S.sos[0].id)`); await shot('11-cancel-confirm');
+      await js(`document.querySelector('#mfoot .btn.danger').click()`); await wait(300);
+      await check('after cancel', `const o=S.sos[0];return {status:o.status,oil:S.products[1].stock[1].q,svcs:o.svcs.length}`);
+      await shot('12-canceled-order');
+      await js(`soFilter='canceled';go('sos')`); await shot('13-canceled-list');
+      await js(`soFilter='all';printSO(S.sos[0].id)`); await shot('14-canceled-pdf');
+      await js(`closePrint();go('so',S.sos[0].id);askUncancel(S.sos[0].id)`); await shot('15-undo-confirm');
+      await js(`document.querySelector('#mfoot .btn.primary').click()`); await wait(300);
+      await check('after undo cancel', `const o=S.sos[0];return {status:o.status,oil:S.products[1].stock[1].q,svcs:o.svcs.length}`);
+      await shot('16-restored');
       note('DONE');
     } catch (e) {
       note('SMOKE FAILED ' + (e.stack || e.message));

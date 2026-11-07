@@ -202,3 +202,90 @@ test('catalog recommendation can be switched off and on; negative stock stays fo
   assert.equal(DB.getState().settings.catalogRec, true);
   assert.throws(() => DB.exec('settings.set', { key: 'negativeStock', value: true }), /უცნობი პარამეტრი/);
 });
+
+test('cancel returns every part to stock and hides services; undo cancel brings everything back', () => {
+  const { sup, pid, vid } = fresh();
+  DB.exec('po.create', { sup, lines: [{ pid, qty: 10, price: 20 }] });
+  const a = DB.exec('so.create', { vid, resp: 'ა' });
+  DB.exec('so.issue', { id: a, pid, qty: 3, serials: 'SN1, SN2' });
+  DB.exec('so.addService', { id: a, name: 'ზეთის შეცვლა', price: 50 });
+  let lid = so(DB.getState(), a).parts[0].lid;
+  DB.exec('so.return', { id: a, lid, qty: 1, serials: ['SN2'] });
+  assert.equal(prod(DB.getState(), pid).stock[1].q, 8);
+
+  DB.exec('so.cancel', { id: a });
+  let st = DB.getState(), o = so(st, a);
+  assert.equal(o.status, 'canceled');
+  assert.equal(o.canceledAt, '2026-11-02');
+  assert.equal(prod(st, pid).stock[1].q, 10, 'the 2 parts still on the order went back');
+  assert.deepEqual(o.svcs, [], 'services are gone while canceled');
+  assert.equal(o.parts.length, 1, 'parts lines stay visible, crossed out');
+  assert.match(st.moves.find(m => m.type === 'ret' && /გაუქმება/.test(m.note || '')).note, /SN1/);
+  assert.throws(() => DB.exec('so.issue', { id: a, pid, qty: 1 }), /გაუქმებულია/);
+  assert.throws(() => DB.exec('so.close', { id: a }), /გაუქმებულია/);
+  assert.throws(() => DB.exec('so.reopen', { id: a }), /გაუქმების გაუქმება/);
+  assert.throws(() => DB.exec('so.cancel', { id: a }), /გაუქმებულია/);
+
+  DB.exec('so.uncancel', { id: a });
+  st = DB.getState(); o = so(st, a);
+  assert.equal(o.status, 'open');
+  assert.equal(o.canceledAt, null);
+  assert.equal(prod(st, pid).stock[1].q, 8, 'the same 2 parts are issued again');
+  assert.deepEqual(o.svcs.map(s => [s.name, s.price]), [['ზეთის შეცვლა', 50]]);
+  assert.deepEqual([o.parts[0].qty, o.parts[0].ret, o.parts[0].serials, o.parts[0].retSerials], [3, 1, ['SN1', 'SN2'], ['SN2']]);
+  assert.throws(() => DB.exec('so.uncancel', { id: a }), /გაუქმებული არ არის/);
+});
+
+test('only open orders can be canceled; undo cancel is refused if the stock or serial was used meanwhile', () => {
+  const { sup, pid, vid } = fresh();
+  DB.exec('po.create', { sup, lines: [{ pid, qty: 2, price: 20 }] });
+  const a = DB.exec('so.create', { vid, resp: 'ა' });
+  DB.exec('so.issue', { id: a, pid, qty: 2, serials: 'SN1' });
+  DB.exec('so.close', { id: a });
+  assert.throws(() => DB.exec('so.cancel', { id: a }), /დახურულია/);
+  DB.exec('so.reopen', { id: a });
+  DB.exec('so.cancel', { id: a });
+
+  // The serial went back with the cancel, so another order may now use it.
+  const b = DB.exec('so.create', { vid, resp: 'ბ' });
+  DB.exec('so.issue', { id: b, pid, qty: 1, serials: 'SN1' });
+  assert.throws(() => DB.exec('so.uncancel', { id: a }), /SN1.*გაცემულია/);
+  DB.exec('so.setSerials', { id: b, lid: so(DB.getState(), b).parts[0].lid, serials: '' });
+  assert.throws(() => DB.exec('so.uncancel', { id: a }), /არასაკმარისი ნაშთი/);
+  const st = DB.getState();
+  assert.equal(so(st, a).status, 'canceled', 'a refused undo changes nothing');
+  assert.equal(prod(st, pid).stock[1].q, 1);
+});
+
+test('canceled orders do not teach the catalog and never auto-close', () => {
+  const { sup, pid, vid } = fresh();
+  DB.exec('po.create', { sup, lines: [{ pid, qty: 5, price: 20 }] });
+  for (let i = 0; i < 2; i++) { const o = DB.exec('so.create', { vid, resp: 'ა' }); DB.exec('so.issue', { id: o, pid, qty: 1 }); DB.exec('so.cancel', { id: o }); }
+  assert.equal(DB.exec('catalog.learn'), 0);
+  day(2026, 12, 30);
+  assert.equal(DB.getState().sos.every(o => o.status === 'canceled'), true);
+});
+
+test('upgrading an existing database keeps its service orders, parts and services', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const os = require('node:os'), path = require('node:path'), fs = require('node:fs');
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'belo-')), 'old.db');
+  // Build a database as the previous version left it (first two upgrade steps only).
+  const old = new DatabaseSync(file);
+  old.exec('CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)');
+  DB.MIGRATIONS.slice(0, 2).forEach(sql => old.exec(sql));
+  old.exec(`INSERT INTO meta VALUES('schema','2');
+    INSERT INTO products(id,art,name,uom,avg_cost) VALUES('P-00001','OF-1','ფილტრი','ცალი',20);
+    INSERT INTO vehicles(id,plate,vin,make,model,km) VALUES('V-1','AA-001-AA','MR0HA3CD1M0512345','Toyota','Hilux',1000);
+    INSERT INTO service_orders VALUES('SO-2026-0001','2026-10-01','V-1','ა',1000,'closed','2026-10-02','2026-10-02');
+    INSERT INTO so_parts(so_id,product_id,wh_id,qty,ret,price) VALUES('SO-2026-0001','P-00001',1,2,0,20);
+    INSERT INTO so_services(so_id,name,price) VALUES('SO-2026-0001','შეცვლა',30);`);
+  old.close();
+  DB.close();
+  DB.open(file);
+  const o = so(DB.getState(), 'SO-2026-0001');
+  assert.deepEqual([o.status, o.closedAt, o.parts.length, o.svcs.length, o.canceledAt], ['closed', '2026-10-02', 1, 1, null]);
+  assert.deepEqual(DB.handle().prepare('PRAGMA foreign_key_check').all(), []);
+  assert.equal(DB.handle().prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
+  DB.close();
+});
